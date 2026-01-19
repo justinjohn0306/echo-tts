@@ -5,7 +5,6 @@ from huggingface_hub import hf_hub_download
 import safetensors.torch as st
 import torch
 import torchaudio
-from torchcodec.decoders import AudioDecoder
 
 from autoencoder import DAC, build_ae
 from model import EchoDiT
@@ -101,15 +100,90 @@ def load_pca_state_from_hf(repo_id: str = "jordand/echo-tts-base", device: str =
 # ________
 
 def load_audio(path: str, max_duration: int = 300) -> torch.Tensor:
+    """
+    Load audio robustly on Windows.
+    Returns mono audio shaped as (1, length) at 44.1 kHz, normalized [-1, 1].
 
-    decoder = AudioDecoder(path)
-    sr = decoder.metadata.sample_rate
-    audio = decoder.get_samples_played_in_range(0, max_duration)
-    audio = audio.data.mean(dim=0).unsqueeze(0)
-    audio = torchaudio.functional.resample(audio, sr, 44_100)
-    audio = audio / torch.maximum(audio.abs().max(), torch.tensor(1.))
-    # is this better than clipping? should we target a specific energy level?
-    return audio
+    - For .wav: try torchaudio.load first, fallback to soundfile if torchaudio backend missing
+    - For other formats: use torchcodec AudioDecoder
+    """
+    path = str(path)
+
+    def _to_mono(x: torch.Tensor) -> torch.Tensor:
+        # x: (C, T) or (T,)
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+        if x.ndim == 2 and x.shape[0] > 1:
+            x = x.mean(dim=0, keepdim=True)
+        return x
+
+    def _crop(x: torch.Tensor, sr: int) -> torch.Tensor:
+        if max_duration is not None and max_duration > 0 and sr is not None:
+            max_frames = int(sr * max_duration)
+            x = x[..., :max_frames]
+        return x
+
+    def _resample_to_44100(x: torch.Tensor, sr: int) -> torch.Tensor:
+        if sr != 44_100:
+            x = torchaudio.functional.resample(x, sr, 44_100)
+        return x
+
+    def _normalize(x: torch.Tensor) -> torch.Tensor:
+        max_val = x.abs().max()
+        denom = torch.maximum(max_val, torch.tensor(1.0, device=x.device, dtype=x.dtype))
+        return x / denom
+
+    # ---- WAV path (prefer torchaudio; fallback if backend missing)
+    if path.lower().endswith(".wav"):
+        try:
+            waveform, sr = torchaudio.load(path)  # <-- may fail on Windows if no backend
+            waveform = _to_mono(waveform)
+            waveform = _crop(waveform, sr)
+            waveform = _resample_to_44100(waveform, sr)
+            waveform = _normalize(waveform)
+            return waveform
+
+        except Exception as e:
+            # Fallback: soundfile (works great on Windows)
+            try:
+                import soundfile as sf
+                import numpy as np
+
+                audio, sr = sf.read(path, always_2d=False)
+                if isinstance(audio, np.ndarray):
+                    if audio.ndim == 2:
+                        # (T, C) -> mono
+                        audio = audio.mean(axis=1)
+                    audio_t = torch.from_numpy(audio).float().unsqueeze(0)
+                else:
+                    # extremely defensive
+                    audio_t = torch.tensor(audio, dtype=torch.float32).unsqueeze(0)
+
+                audio_t = _crop(audio_t, sr)
+                audio_t = _resample_to_44100(audio_t, sr)
+                audio_t = _normalize(audio_t)
+                return audio_t
+
+            except Exception as e2:
+                raise RuntimeError(
+                    f"Failed to load WAV audio. torchaudio error: {e} | soundfile error: {e2}"
+                ) from e2
+
+    # ---- Non-WAV formats via torchcodec
+    else:
+        from torchcodec.decoders import AudioDecoder
+
+        decoder = AudioDecoder(path)
+        sr = decoder.metadata.sample_rate
+
+        audio = decoder.get_samples_played_in_range(0, max_duration)
+        audio = audio.data.mean(dim=0).unsqueeze(0)  # mono
+
+        audio = _resample_to_44100(audio, sr)
+        audio = _normalize(audio)
+
+        return audio
+
 
 def tokenizer_encode(text: str, append_bos: bool = True, normalize: bool = True, return_normalized_text: bool = False) -> torch.Tensor | Tuple[torch.Tensor, str]:
 
